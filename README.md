@@ -78,6 +78,10 @@ and installs, enables and starts the systemd user service `network-data-share.se
 which runs the binary at its current location with that config file.
 Running `--setup` again overwrites the config file and restarts the service with the new configuration.
 Add `--no-service` to only write the config file and the certificate, for example on systems without systemd.
+`--dry-run` prints the config file and service unit that would be written and the `systemctl` commands that would run,
+without changing anything, so a setup can be checked before it is applied.
+`--info` ends with a `--setup` command that reproduces the configuration currently in effect,
+as a starting point to adjust instead of assembling the options by hand.
 A user service stops when the user logs out, `loginctl enable-linger` keeps it running.
 
 ## How it works

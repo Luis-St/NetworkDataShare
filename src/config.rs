@@ -40,6 +40,10 @@ struct Cli {
     /// With --setup: do not install the systemd user service.
     #[arg(long, requires = "setup")]
     no_service: bool,
+
+    /// With --setup: only print what would be written and run, change nothing.
+    #[arg(long, requires = "setup")]
+    dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -116,7 +120,7 @@ pub fn load() -> Mode {
 
     if cli.setup {
         // Setup stores what was passed and the defaults for everything else, not an older file.
-        return Mode::Exit(match setup(cli.config, &path, !cli.no_service) {
+        return Mode::Exit(match setup(cli.config, &path, !cli.no_service, cli.dry_run) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("setup failed: {e}");
@@ -206,33 +210,93 @@ fn info(config: &Config, path: &Path, loaded: bool) {
         println!("Certificate:     self-signed, in {}", config.data_dir().display());
     }
     println!();
-    println!("Run with --help for all options and --setup to install it.");
+    println!("Setup:");
+    println!("  --setup writes the given options, and the defaults for all others, to the config file,");
+    println!("  generates the certificate and installs and starts the systemd user service {SERVICE_NAME}.");
+    println!("  Add --dry-run to only show what it would do, --no-service to skip the service");
+    println!("  and --config FILE to write another config file. This command sets up the configuration above,");
+    println!("  change or drop options as needed:");
+    println!();
+    println!("  {}", setup_command(config));
+    println!();
+    println!("Run with --help for all options.");
 }
 
-fn setup(mut config: Config, path: &Path, service: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// A `--setup` command that reproduces the given configuration.
+fn setup_command(config: &Config) -> String {
+    let quote = |p: &Path| {
+        let s = p.display().to_string();
+        if s.chars().all(|c| c.is_ascii_alphanumeric() || "/._-~".contains(c)) { s } else { format!("'{}'", s.replace('\'', "'\\''")) }
+    };
+    let exe = std::env::args().next().unwrap_or_else(|| "network-data-share".into());
+    let mut cmd = format!(
+        "{} --setup --bind {} --invite-timeout {} --reconnect-grace {} --max-clients-per-ip {}",
+        quote(Path::new(&exe)),
+        config.bind,
+        config.invite_timeout,
+        config.reconnect_grace,
+        config.max_clients_per_ip
+    );
+    if config.http {
+        cmd += " --http";
+    }
+    for (flag, value) in [("--cert", &config.cert), ("--key", &config.key), ("--data-dir", &config.data_dir)] {
+        if let Some(p) = value {
+            cmd += &format!(" {flag} {}", quote(p));
+        }
+    }
+    cmd
+}
+
+fn setup(mut config: Config, path: &Path, service: bool, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     // The service runs in another working directory, so relative paths are resolved now.
     for p in [&mut config.cert, &mut config.key, &mut config.data_dir].into_iter().flatten() {
         *p = std::path::absolute(&*p)?;
     }
     let path = std::path::absolute(path)?;
 
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    let contents = render(&config)?;
+    if dry_run {
+        println!("Dry run, nothing is written or started.");
+        println!();
+        println!("Would write config file {}:", path.display());
+        println!();
+        print_indented(&contents);
+    } else {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&path, contents)?;
+        println!("Wrote config file {}", path.display());
     }
-    std::fs::write(&path, render(&config)?)?;
-    println!("Wrote config file {}", path.display());
 
     if config.http {
         println!("Plain HTTP configured, no certificate needed.");
+    } else if dry_run {
+        match crate::tls::pending_certificate(&config)? {
+            Some(cert) => println!("Would generate a self-signed certificate {}", cert.display()),
+            None => println!("Would use the existing certificate in {}", certificate_location(&config).display()),
+        }
     } else {
         let (cert, _) = crate::tls::certificate(&config)?;
         println!("Certificate ready: {}", cert.display());
     }
 
     if service {
-        install_service(&path)?;
+        install_service(&path, dry_run)?;
     }
     Ok(())
+}
+
+fn certificate_location(config: &Config) -> PathBuf {
+    config.cert.clone().unwrap_or_else(|| config.data_dir())
+}
+
+fn print_indented(text: &str) {
+    for line in text.lines() {
+        if line.is_empty() { println!() } else { println!("  {line}") }
+    }
+    println!();
 }
 
 fn render(config: &Config) -> Result<String, Box<dyn std::error::Error>> {
@@ -270,7 +334,7 @@ fn render(config: &Config) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 #[cfg(target_os = "linux")]
-fn install_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_service(config_path: &Path, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::process::Command;
 
     let exe = std::env::current_exe()?;
@@ -287,12 +351,24 @@ fn install_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>>
         quote(config_path)
     );
     let dir = dirs::config_dir().ok_or("no user config directory")?.join("systemd/user");
-    std::fs::create_dir_all(&dir)?;
     let unit_path = dir.join(SERVICE_NAME);
+    let commands = [&["daemon-reload"][..], &["enable", SERVICE_NAME], &["restart", SERVICE_NAME]];
+    if dry_run {
+        println!();
+        println!("Would write systemd user service {}:", unit_path.display());
+        println!();
+        print_indented(&unit);
+        println!("Would run:");
+        for args in commands {
+            println!("  systemctl --user {}", args.join(" "));
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir)?;
     std::fs::write(&unit_path, unit)?;
     println!("Wrote systemd user service {}", unit_path.display());
 
-    for args in [&["daemon-reload"][..], &["enable", SERVICE_NAME], &["restart", SERVICE_NAME]] {
+    for args in commands {
         let status = Command::new("systemctl")
             .arg("--user")
             .args(args)
@@ -308,6 +384,6 @@ fn install_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[cfg(not(target_os = "linux"))]
-fn install_service(_config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn install_service(_config_path: &Path, _dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     Err("installing a service is only supported on Linux, use --no-service to skip it".into())
 }

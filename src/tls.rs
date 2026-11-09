@@ -61,6 +61,19 @@ pub fn certificate(config: &Config) -> Result<(PathBuf, PathBuf), Box<dyn std::e
     }
 }
 
+/// The certificate path that would be generated, or `None` when the existing or configured one is used.
+pub fn pending_certificate(config: &Config) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    match (&config.cert, &config.key) {
+        (Some(_), Some(_)) => Ok(None),
+        (None, None) => {
+            let dir = config.data_dir();
+            let (cert, key, names) = (dir.join("cert.pem"), dir.join("key.pem"), dir.join("cert.names"));
+            Ok(needs_generation(&cert, &key, &names, &subject_names()).then_some(cert))
+        }
+        _ => Err("--cert and --key must be given together".into()),
+    }
+}
+
 /// Regenerates when files are missing, the certificate is about to expire, or a current host name or
 /// IP address is not covered (e.g. the machine got a new address).
 fn needs_generation(cert: &Path, key: &Path, names_file: &Path, wanted: &[String]) -> bool {
