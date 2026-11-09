@@ -1,2 +1,29 @@
+# Rust build output
 /target
+
+# Frontend dependencies and build output
+/web/node_modules
+/web/dist
+
+# Generated certificates and local data, never commit private keys
 /data
+*.pem
+*.key
+cert.names
+
+# Local configuration and environment
+.env
+.env.*
+config.toml
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
