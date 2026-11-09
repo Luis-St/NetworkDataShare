@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { app, type ChatItem } from '../lib/app.svelte';
+  import { app, isPreviewable, type ChatItem } from '../lib/app.svelte';
   import { canCopyImages, copyImage, copyText, formatSize, formatTime, linkify } from '../lib/util';
 
   let { item, onload }: { item: ChatItem; onload?: () => void } = $props();
@@ -17,7 +17,7 @@
 
   const transfer = $derived(item.kind === 'file' ? item.transfer : undefined);
   const percent = $derived(transfer && transfer.total > 0 ? Math.round((transfer.bytes / transfer.total) * 100) : 0);
-  const isImage = $derived(item.kind === 'file' && item.mime.startsWith('image/'));
+  const isImage = $derived(item.kind === 'file' && isPreviewable(item.mime));
 </script>
 
 {#if item.kind === 'system'}

@@ -30,10 +30,18 @@ pub fn acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Erro
     let (cert_path, key_path) = match (&config.cert, &config.key) {
         (Some(c), Some(k)) => (c.clone(), k.clone()),
         (None, None) => {
-            let cert = config.data_dir.join("cert.pem");
-            let key = config.data_dir.join("key.pem");
-            if needs_generation(&cert, &key) {
-                generate(&cert, &key)?;
+            let dir = config.data_dir();
+            let (cert, key, names) = (dir.join("cert.pem"), dir.join("key.pem"), dir.join("cert.names"));
+            let mut wanted = subject_names();
+            if needs_generation(&cert, &key, &names, &wanted) {
+                // Keep earlier names so addresses that come and go (VPN, hotspot) do not cause a new
+                // certificate, and with it a new browser warning, on every change.
+                for old in fs::read_to_string(&names).unwrap_or_default().lines() {
+                    if !old.is_empty() && !wanted.iter().any(|n| n == old) {
+                        wanted.push(old.to_string());
+                    }
+                }
+                generate(&cert, &key, &names, &wanted)?;
             }
             (cert, key)
         }
@@ -49,19 +57,22 @@ pub fn acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Erro
     Ok(TlsAcceptor::from(Arc::new(tls)))
 }
 
-fn needs_generation(cert: &Path, key: &Path) -> bool {
+/// Regenerates when files are missing, the certificate is about to expire, or a current host name or
+/// IP address is not covered (e.g. the machine got a new address).
+fn needs_generation(cert: &Path, key: &Path, names_file: &Path, wanted: &[String]) -> bool {
     if !cert.exists() || !key.exists() {
         return true;
     }
     let age = fs::metadata(cert).and_then(|m| m.modified()).ok().and_then(|t| SystemTime::now().duration_since(t).ok());
-    age.is_none_or(|a| a > REGENERATE_AFTER)
+    if age.is_none_or(|a| a > REGENERATE_AFTER) {
+        return true;
+    }
+    let covered = fs::read_to_string(names_file).unwrap_or_default();
+    let covered: Vec<&str> = covered.lines().collect();
+    wanted.iter().any(|n| !covered.contains(&n.as_str()))
 }
 
-pub fn local_ips() -> Vec<IpAddr> {
-    if_addrs::get_if_addrs().map(|ifs| ifs.into_iter().map(|i| i.ip()).collect()).unwrap_or_default()
-}
-
-fn generate(cert_path: &Path, key_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn subject_names() -> Vec<String> {
     let mut names = vec!["localhost".to_string()];
     if let Ok(host) = gethostname::gethostname().into_string() {
         if !host.is_empty() {
@@ -73,8 +84,32 @@ fn generate(cert_path: &Path, key_path: &Path) -> Result<(), Box<dyn std::error:
         names.push(ip.to_string());
     }
     names.dedup();
+    names
+}
 
-    let mut params = CertificateParams::new(names.clone())?;
+/// Writes a file that only the owner can read, without a window in which it is readable by others.
+fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        opts.mode(0o600);
+        // An existing file keeps its old mode on open, so tighten it before writing.
+        if path.exists() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    opts.open(path)?.write_all(contents)
+}
+
+pub fn local_ips() -> Vec<IpAddr> {
+    if_addrs::get_if_addrs().map(|ifs| ifs.into_iter().map(|i| i.ip()).collect()).unwrap_or_default()
+}
+
+fn generate(cert_path: &Path, key_path: &Path, names_path: &Path, names: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut params = CertificateParams::new(names.to_vec())?;
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, "NetworkDataShare");
     params.distinguished_name = dn;
@@ -92,13 +127,9 @@ fn generate(cert_path: &Path, key_path: &Path) -> Result<(), Box<dyn std::error:
     if let Some(dir) = key_path.parent() {
         fs::create_dir_all(dir)?;
     }
+    write_private(key_path, key.serialize_pem().as_bytes())?;
     fs::write(cert_path, cert.pem())?;
-    fs::write(key_path, key.serialize_pem())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
-    }
+    fs::write(names_path, names.join("\n"))?;
     tracing::info!("generated self-signed certificate for {}", names.join(", "));
     Ok(())
 }

@@ -5,7 +5,6 @@
 
   let { session }: { session: ChatSession } = $props();
 
-  let text = $state('');
   let list: HTMLDivElement;
   let input: HTMLTextAreaElement;
   let fileInput: HTMLInputElement;
@@ -15,9 +14,9 @@
   const disabled = $derived(session.closed !== null);
 
   function send() {
-    if (!text.trim()) return;
-    app.sendText(session.id, text);
-    text = '';
+    if (!session.draft.trim()) return;
+    app.sendText(session.id, session.draft);
+    session.draft = '';
     stickToBottom = true;
     input.style.height = '';
   }
@@ -92,9 +91,9 @@
   }}
   ondragleave={() => (dragDepth = Math.max(0, dragDepth - 1))}
   ondrop={(e) => {
+    dragDepth = 0;
     if (!hasFiles(e)) return;
     e.preventDefault();
-    dragDepth = 0;
     sendFiles(e.dataTransfer?.files);
   }}
 >
@@ -113,7 +112,7 @@
   </div>
 
   <div class="messages" bind:this={list} onscroll={onScroll}>
-    {#each session.items as item (item.id)}
+    {#each session.items as item (item.key)}
       <Message {item} onload={scrollDown} />
     {/each}
   </div>
@@ -128,12 +127,12 @@
       rows="1"
       placeholder={disabled ? 'This session has ended' : 'Type a message, paste an image or drop files...'}
       bind:this={input}
-      bind:value={text}
+      bind:value={session.draft}
       oninput={autoGrow}
       onkeydown={onKeydown}
       {disabled}
     ></textarea>
-    <button class="primary" onclick={send} disabled={disabled || !text.trim()}>Send</button>
+    <button class="primary" onclick={send} disabled={disabled || !session.draft.trim()}>Send</button>
   </div>
 
   {#if dragDepth > 0 && !disabled}

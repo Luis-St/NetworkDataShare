@@ -16,7 +16,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls-pki-types = { version = "1.9", features = ["std"] }
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring", "pem"] }
 time = "0.3"
-rust-embed = "8"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,6 +28,7 @@ if-addrs = "0.13"
 gethostname = "0.5"
 percent-encoding = "2"
 bytes = "1"
+dirs = "6"
 
 [profile.release]
 lto = true

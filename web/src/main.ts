@@ -8,6 +8,6 @@ for (const ev of ['pointerdown', 'keydown'] as const) {
   window.addEventListener(ev, unlockAudio, { once: true, capture: true });
 }
 
-app.connect();
+void app.start();
 
 export default mount(App, { target: document.getElementById('app')! });

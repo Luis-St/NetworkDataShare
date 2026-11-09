@@ -4,17 +4,52 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use axum::extract::ws::Utf8Bytes;
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::Config;
 use crate::protocol::{ClientInfo, InviteOutcome, ServerMsg, SessionEndReason};
 
-pub type ClientTx = mpsc::UnboundedSender<ServerMsg>;
 pub type ChunkTx = mpsc::Sender<Result<Bytes, io::Error>>;
+
+/// Queued but unsent bytes above which relayed user content is refused for a client.
+const RELAY_QUEUE_LIMIT: usize = 4 << 20;
+/// Queued but unsent bytes above which a client is considered stuck and disconnected.
+const HARD_QUEUE_LIMIT: usize = 16 << 20;
+/// How long a download ticket stays valid.
+const TICKET_TTL: Duration = Duration::from_secs(30);
+
+/// The sending half of one WebSocket connection.
+pub struct Conn {
+    pub tx: mpsc::UnboundedSender<Utf8Bytes>,
+    /// Bytes handed to the writer task that are not yet written to the socket.
+    pub queued: Arc<AtomicUsize>,
+    /// Signalled to terminate the connection (stuck client or taken over by a reconnect).
+    pub kick: Arc<Notify>,
+}
+
+impl Conn {
+    fn push(&self, msg: Utf8Bytes, limit: usize) -> bool {
+        let len = msg.len();
+        if self.queued.load(Ordering::Relaxed) + len > limit {
+            if limit == HARD_QUEUE_LIMIT {
+                self.kick.notify_one();
+            }
+            return false;
+        }
+        self.queued.fetch_add(len, Ordering::Relaxed);
+        if self.tx.send(msg).is_err() {
+            self.queued.fetch_sub(len, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
 
 pub struct Client {
     pub id: String,
@@ -23,8 +58,8 @@ pub struct Client {
     pub device: String,
     pub ip: String,
     /// `None` while the client is disconnected but still inside the reconnect grace period.
-    pub tx: Option<ClientTx>,
-    /// Incremented on every (re)connect so stale disconnect timers can be ignored.
+    pub conn: Option<Conn>,
+    /// Incremented on every (re)connect so stale connections and timers can be ignored.
     pub conn_gen: u64,
 }
 
@@ -74,19 +109,39 @@ pub struct FileOffer {
 /// A download that is waiting for the sender to start the matching upload.
 pub struct PendingUpload {
     pub file_id: String,
+    pub session_id: String,
     pub owner: String,
     pub receiver: String,
     pub size: u64,
     pub tx: ChunkTx,
+    /// Bytes the download response has taken from the channel.
+    pub consumed: Arc<AtomicU64>,
+}
+
+/// A running upload, so that ending its session can abort it.
+pub struct ActiveTransfer {
+    pub session_id: String,
+    pub abort: Arc<Notify>,
+}
+
+/// A single-use permission to download one file, so the long-lived token never appears in a URL.
+pub struct Ticket {
+    pub client: String,
+    pub file_id: String,
+    pub expires_at: Instant,
 }
 
 #[derive(Default)]
 pub struct Inner {
     pub clients: HashMap<String, Client>,
+    /// Token -> client id.
+    pub tokens: HashMap<String, String>,
     pub invites: HashMap<String, Invite>,
     pub sessions: HashMap<String, Session>,
     pub files: HashMap<String, FileOffer>,
     pub uploads: HashMap<String, PendingUpload>,
+    pub transfers: HashMap<String, ActiveTransfer>,
+    pub tickets: HashMap<String, Ticket>,
 }
 
 #[derive(Clone)]
@@ -113,30 +168,41 @@ pub fn new_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
+pub fn encode(msg: &ServerMsg) -> Utf8Bytes {
+    serde_json::to_string(msg).unwrap_or_default().into()
+}
+
 impl Inner {
-    /// Sends a message to a client if it is currently connected. Returns whether it was queued.
+    fn conn(&self, client_id: &str) -> Option<&Conn> {
+        self.clients.get(client_id).and_then(|c| c.conn.as_ref())
+    }
+
+    /// Sends a control message. A client whose queue overflows is disconnected.
     pub fn send(&self, client_id: &str, msg: ServerMsg) -> bool {
-        match self.clients.get(client_id).and_then(|c| c.tx.as_ref()) {
-            Some(tx) => tx.send(msg).is_ok(),
-            None => false,
-        }
+        self.conn(client_id).is_some_and(|c| c.push(encode(&msg), HARD_QUEUE_LIMIT))
+    }
+
+    /// Sends user content from a peer. Refused (returns false) while the receiver is not keeping up.
+    pub fn relay(&self, client_id: &str, msg: ServerMsg) -> bool {
+        self.conn(client_id).is_some_and(|c| c.push(encode(&msg), RELAY_QUEUE_LIMIT))
     }
 
     pub fn is_online(&self, client_id: &str) -> bool {
-        self.clients.get(client_id).is_some_and(|c| c.tx.is_some())
+        self.conn(client_id).is_some()
     }
 
     pub fn client_by_token(&self, token: &str) -> Option<&Client> {
-        self.clients.values().find(|c| c.token == token)
+        self.tokens.get(token).and_then(|id| self.clients.get(id))
     }
 
     pub fn broadcast_clients(&self) {
         let mut clients: Vec<ClientInfo> =
-            self.clients.values().filter(|c| c.tx.is_some()).map(Client::info).collect();
+            self.clients.values().filter(|c| c.conn.is_some()).map(Client::info).collect();
         clients.sort_by(|a, b| a.ip.cmp(&b.ip).then_with(|| a.id.cmp(&b.id)));
+        let msg = encode(&ServerMsg::Clients { clients });
         for c in self.clients.values() {
-            if let Some(tx) = &c.tx {
-                let _ = tx.send(ServerMsg::Clients { clients: clients.clone() });
+            if let Some(conn) = &c.conn {
+                conn.push(msg.clone(), HARD_QUEUE_LIMIT);
             }
         }
     }
@@ -152,9 +218,29 @@ impl Inner {
         self.sessions.iter().filter(|(_, s)| s.peer_of(client_id).is_some()).map(|(id, _)| id.clone()).collect()
     }
 
+    /// Reports a failed transfer to both sides.
+    pub fn transfer_failed(&self, owner: &str, receiver: &str, file_id: &str, req_id: &str, error: &str) {
+        let msg = ServerMsg::TransferFailed { file_id: file_id.into(), req_id: req_id.into(), error: error.into() };
+        self.send(owner, msg.clone());
+        self.send(receiver, msg);
+    }
+
     pub fn end_session(&mut self, session_id: &str, reason: SessionEndReason, by: Option<&str>) {
         let Some(session) = self.sessions.remove(session_id) else { return };
         self.files.retain(|_, f| f.session_id != session_id);
+        self.tickets.retain(|_, t| self.files.contains_key(&t.file_id));
+        // Downloads that wait for their upload end with an error, running uploads are aborted.
+        self.uploads.retain(|_, u| {
+            if u.session_id == session_id {
+                let _ = u.tx.try_send(Err(io::Error::other("session ended")));
+                false
+            } else {
+                true
+            }
+        });
+        for t in self.transfers.values().filter(|t| t.session_id == session_id) {
+            t.abort.notify_one();
+        }
         for member in [&session.a, &session.b] {
             self.send(
                 member,
@@ -183,6 +269,23 @@ impl Inner {
         Some(invite)
     }
 
+    pub fn issue_ticket(&mut self, client: &str, file_id: &str) -> String {
+        let now = Instant::now();
+        self.tickets.retain(|_, t| t.expires_at > now);
+        let ticket = new_id();
+        self.tickets.insert(
+            ticket.clone(),
+            Ticket { client: client.to_string(), file_id: file_id.to_string(), expires_at: now + TICKET_TTL },
+        );
+        ticket
+    }
+
+    /// Consumes a ticket and returns the client it was issued to.
+    pub fn redeem_ticket(&mut self, ticket: &str, file_id: &str) -> Option<String> {
+        let t = self.tickets.remove(ticket)?;
+        (t.file_id == file_id && t.expires_at > Instant::now()).then_some(t.client)
+    }
+
     /// Removes a client for good (after the reconnect grace period ran out).
     pub fn remove_client(&mut self, client_id: &str) {
         for sid in self.sessions_of(client_id) {
@@ -198,9 +301,10 @@ impl Inner {
             let outcome = if was_sender { InviteOutcome::Cancelled } else { InviteOutcome::Unavailable };
             self.resolve_invite(&id, outcome, None);
         }
-        self.files.retain(|_, f| f.owner != client_id && f.receiver != client_id);
-        self.uploads.retain(|_, u| u.owner != client_id && u.receiver != client_id);
-        self.clients.remove(client_id);
+        self.tickets.retain(|_, t| t.client != client_id);
+        if let Some(c) = self.clients.remove(client_id) {
+            self.tokens.remove(&c.token);
+        }
         self.broadcast_clients();
     }
 }

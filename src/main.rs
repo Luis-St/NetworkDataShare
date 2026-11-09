@@ -20,7 +20,7 @@ use axum::response::Response;
 use axum::routing::{get, post};
 use clap::Parser;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -57,10 +57,28 @@ pub struct Config {
     #[arg(long, env = "NDS_KEY")]
     pub key: Option<PathBuf>,
 
-    /// Directory where the generated certificate is stored.
-    #[arg(long, env = "NDS_DATA_DIR", default_value = "data")]
-    pub data_dir: PathBuf,
+    /// Directory where the generated certificate is stored [default: the user's local data
+    /// directory, e.g. ~/.local/share/network-data-share].
+    #[arg(long, env = "NDS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+
+    /// Maximum number of clients (browser tabs) per IP address.
+    #[arg(long, env = "NDS_MAX_CLIENTS_PER_IP", default_value_t = 32)]
+    pub max_clients_per_ip: usize,
 }
+
+impl Config {
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(|| {
+            dirs::data_local_dir().map(|d| d.join("network-data-share")).unwrap_or_else(|| PathBuf::from("data"))
+        })
+    }
+}
+
+/// Time a client has to finish the TLS handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time a client has to send the complete headers of a request.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() {
@@ -120,14 +138,15 @@ async fn main() {
             };
             // Plain HTTP requests on the HTTPS port are redirected; a TLS handshake starts with 0x16.
             let mut first = [0u8; 1];
-            match tokio::time::timeout(Duration::from_secs(10), stream.peek(&mut first)).await {
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.peek(&mut first)).await {
                 Ok(Ok(1)) => {}
                 _ => return,
             }
             if first[0] == 0x16 {
-                match acceptor.accept(stream).await {
-                    Ok(tls) => serve(tls, svc).await,
-                    Err(e) => tracing::debug!("TLS handshake with {addr} failed: {e}"),
+                match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls)) => serve(tls, svc).await,
+                    Ok(Err(e)) => tracing::debug!("TLS handshake with {addr} failed: {e}"),
+                    Err(_) => tracing::debug!("TLS handshake with {addr} timed out"),
                 }
             } else {
                 serve(stream, tower::service_fn(redirect_to_https)).await;
@@ -142,7 +161,8 @@ where
     S: tower::Service<Request<Incoming>, Response = Response, Error = Infallible> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
-    let builder = auto::Builder::new(TokioExecutor::new());
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
     if let Err(e) = builder.serve_connection_with_upgrades(TokioIo::new(io), TowerToHyperService::new(svc)).await {
         tracing::debug!("connection error: {e}");
     }
@@ -151,9 +171,13 @@ where
 async fn redirect_to_https(req: Request<Incoming>) -> Result<Response, Infallible> {
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
     let path = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let path = if path.starts_with('/') { path } else { "/" };
+    // Only a plain host[:port] is accepted, so the Host header cannot smuggle in a path or userinfo.
+    let valid_host =
+        !host.is_empty() && host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'));
     let mut res = Response::new(Body::empty());
     match HeaderValue::from_str(&format!("https://{host}{path}")) {
-        Ok(location) if !host.is_empty() => {
+        Ok(location) if valid_host => {
             *res.status_mut() = StatusCode::PERMANENT_REDIRECT;
             res.headers_mut().insert(header::LOCATION, location);
         }

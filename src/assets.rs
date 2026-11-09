@@ -1,12 +1,18 @@
-//! Serves the frontend that `build.rs` compiled into `web/dist`.
+//! Serves the frontend that `build.rs` compiled into `$OUT_DIR/web-dist`.
 
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::Embed;
 
 #[derive(Embed)]
-#[folder = "web/dist"]
+#[folder = "$OUT_DIR/web-dist"]
 struct Assets;
+
+/// Scripts only from this origin: even if peer content ended up in a document (e.g. a blob opened in a
+/// new tab inherits this policy), it cannot run inline script.
+const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+    img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; object-src 'none'; \
+    base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
 pub async fn serve(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
@@ -30,5 +36,8 @@ pub async fn serve(uri: Uri) -> Response {
         HeaderValue::from_str(mime.as_ref()).unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     res
 }

@@ -16,6 +16,21 @@
     document.title = n > 0 ? `(${n}) NetworkDataShare` : 'NetworkDataShare';
   });
 
+  // A file dropped outside a chat would make the browser open it and wipe the page.
+  $effect(() => {
+    const guard = (e: DragEvent) => {
+      if (!e.dataTransfer?.types.includes('Files')) return;
+      if (e.type === 'drop' && !e.defaultPrevented) app.toast('Open a session to send files.');
+      e.preventDefault();
+    };
+    window.addEventListener('dragover', guard);
+    window.addEventListener('drop', guard);
+    return () => {
+      window.removeEventListener('dragover', guard);
+      window.removeEventListener('drop', guard);
+    };
+  });
+
   // Coming back to the tab marks the open chat as read.
   $effect(() => {
     const onVisible = () => {

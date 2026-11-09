@@ -69,6 +69,10 @@ pub enum ClientMsg {
     FileUnavailable {
         req_id: String,
     },
+    /// Asks for a single-use ticket to download a file offered to this client.
+    RequestDownload {
+        file_id: String,
+    },
     Ping,
 }
 
@@ -139,6 +143,10 @@ pub enum ServerMsg {
     DeliveryFailed {
         session_id: String,
         msg_id: String,
+    },
+    DownloadTicket {
+        file_id: String,
+        ticket: String,
     },
     UploadRequest {
         file_id: String,

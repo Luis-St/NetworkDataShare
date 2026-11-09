@@ -1,28 +1,49 @@
 //! WebSocket endpoint: presence, invites, sessions and text relay.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use crate::protocol::{ClientMsg, InviteOutcome, ServerMsg, SessionEndReason};
-use crate::state::{AppState, Client, FileOffer, Invite, Session, new_id, now_ms};
+use crate::state::{AppState, Client, Conn, FileOffer, Inner, Invite, Session, encode, new_id, now_ms};
 
 const MAX_NAME_LEN: usize = 64;
 const MAX_DEVICE_LEN: usize = 100;
 const MAX_ID_LEN: usize = 64;
-const MAX_TEXT_LEN: usize = 1 << 20;
+/// Maximum text message size in bytes. Longer texts are sent as a file by the browser.
+pub const MAX_TEXT_LEN: usize = 1 << 20;
+/// JSON escaping can grow text up to 6x (`\u0001`), plus room for the other fields.
+const MAX_FRAME_LEN: usize = 6 * MAX_TEXT_LEN + (64 << 10);
+const MAX_FILES_PER_SESSION: usize = 10_000;
+/// Browsers send an application-level ping every 20 s; a silent connection is considered dead.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn handler(
     ws: WebSocketUpgrade,
+    headers: HeaderMap,
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> Response {
-    ws.max_message_size(2 * MAX_TEXT_LEN).on_upgrade(move |socket| handle_socket(socket, state, addr))
+    if !same_origin(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin WebSocket connections are not allowed").into_response();
+    }
+    ws.max_message_size(MAX_FRAME_LEN).on_upgrade(move |socket| handle_socket(socket, state, addr))
+}
+
+/// Rejects WebSockets opened by other websites. Non-browser clients send no Origin and are allowed.
+fn same_origin(headers: &HeaderMap) -> bool {
+    let Some(origin) = headers.get(header::ORIGIN).and_then(|o| o.to_str().ok()) else { return true };
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
+    let origin_host = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    !host.is_empty() && origin_host.eq_ignore_ascii_case(host)
 }
 
 fn clean(s: &str, max: usize) -> String {
@@ -49,32 +70,46 @@ async fn handle_socket(socket: WebSocket, state: AppState, addr: SocketAddr) {
     };
     let ClientMsg::Hello { client_id, token, name, device } = hello else { return };
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<ServerMsg>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Utf8Bytes>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let kick = Arc::new(Notify::new());
+    let conn = Conn { tx, queued: queued.clone(), kick: kick.clone() };
     let ip = addr.ip().to_canonical().to_string();
-    let (my_id, conn_gen) = register(&state, client_id, token, name, device, ip, tx);
+    let Some((my_id, conn_gen)) = register(&state, client_id, token, name, device, ip, conn) else {
+        let msg = encode(&ServerMsg::Error { message: "too many connections from your address".into() });
+        let _ = sink.send(Message::Text(msg)).await;
+        let _ = sink.close().await;
+        return;
+    };
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let Ok(json) = serde_json::to_string(&msg) else { continue };
-            if sink.send(Message::Text(json.into())).await.is_err() {
+            let len = msg.len();
+            if sink.send(Message::Text(msg)).await.is_err() {
                 break;
             }
+            queued.fetch_sub(len, Ordering::Relaxed);
         }
         let _ = sink.close().await;
     });
 
-    // Browsers send an application-level ping every 20 s; a silent connection is considered dead.
-    while let Ok(Some(Ok(msg))) = tokio::time::timeout(Duration::from_secs(60), stream.next()).await {
-        match msg {
-            Message::Text(t) => match serde_json::from_str::<ClientMsg>(&t) {
-                Ok(msg) => dispatch(&state, &my_id, msg),
-                Err(e) => {
-                    state.lock().send(&my_id, ServerMsg::Error { message: format!("invalid message: {e}") });
-                }
-            },
-            Message::Close(_) => break,
-            _ => {}
+    let reader = async {
+        while let Ok(Some(Ok(msg))) = tokio::time::timeout(READ_TIMEOUT, stream.next()).await {
+            match msg {
+                Message::Text(t) => match serde_json::from_str::<ClientMsg>(&t) {
+                    Ok(msg) => dispatch(&state, &my_id, msg),
+                    Err(e) => {
+                        state.lock().send(&my_id, ServerMsg::Error { message: format!("invalid message: {e}") });
+                    }
+                },
+                Message::Close(_) => break,
+                _ => {}
+            }
         }
+    };
+    tokio::select! {
+        _ = reader => {}
+        _ = kick.notified() => {}
     }
 
     disconnect(&state, &my_id, conn_gen);
@@ -82,6 +117,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, addr: SocketAddr) {
 }
 
 /// Registers a new client or resumes an existing one (same id + token within the grace period).
+/// Returns `None` when the address already has too many clients.
 fn register(
     state: &AppState,
     client_id: Option<String>,
@@ -89,33 +125,40 @@ fn register(
     name: Option<String>,
     device: String,
     ip: String,
-    tx: mpsc::UnboundedSender<ServerMsg>,
-) -> (String, u64) {
+    conn: Conn,
+) -> Option<(String, u64)> {
     let mut inner = state.lock();
     let name = clean_name(name);
     let device = clean(&device, MAX_DEVICE_LEN);
 
     let resumable = match (&client_id, &token) {
-        // A client that is still connected is not resumed: this happens when a browser tab is
-        // duplicated (sessionStorage is copied), and the copy must become its own client.
-        (Some(id), Some(token)) => inner.clients.get(id).is_some_and(|c| &c.token == token && c.tx.is_none()),
+        (Some(id), Some(token)) => inner.clients.get(id).is_some_and(|c| &c.token == token),
         _ => false,
     };
 
     let (id, conn_gen) = if resumable {
         let id = client_id.unwrap();
         let c = inner.clients.get_mut(&id).unwrap();
-        c.tx = Some(tx);
+        // A reconnect takes over: the old connection may still look alive (dead link not yet noticed).
+        // Duplicated browser tabs are detected in the browser and never send stored credentials.
+        if let Some(old) = c.conn.replace(conn) {
+            old.kick.notify_one();
+        }
         c.conn_gen += 1;
         c.name = name;
         c.device = device;
         c.ip = ip.clone();
         (id, c.conn_gen)
     } else {
+        if inner.clients.values().filter(|c| c.ip == ip).count() >= state.config.max_clients_per_ip {
+            return None;
+        }
         let id = new_id();
+        let token = new_id();
+        inner.tokens.insert(token.clone(), id.clone());
         inner.clients.insert(
             id.clone(),
-            Client { id: id.clone(), token: new_id(), name, device, ip: ip.clone(), tx: Some(tx), conn_gen: 0 },
+            Client { id: id.clone(), token, name, device, ip: ip.clone(), conn: Some(conn), conn_gen: 0 },
         );
         (id, 0)
     };
@@ -133,40 +176,35 @@ fn register(
     );
 
     if resumable {
-        // Restore sessions and pending invites.
-        for sid in inner.sessions_of(&id) {
-            let session = &inner.sessions[&sid];
-            let peer_id = session.peer_of(&id).unwrap().to_string();
-            let initiator = session.a == id;
-            let Some(peer) = inner.clients.get(&peer_id).map(Client::info) else { continue };
-            let peer_online = inner.is_online(&peer_id);
-            inner.send(&id, ServerMsg::SessionStarted { session_id: sid.clone(), peer, initiator });
-            inner.send(&id, ServerMsg::PeerStatus { session_id: sid.clone(), online: peer_online });
-            inner.send(&peer_id, ServerMsg::PeerStatus { session_id: sid, online: true });
-        }
-        let now = Instant::now();
-        let invites: Vec<ServerMsg> = inner
-            .invites
-            .iter()
-            .filter_map(|(iid, inv)| {
-                let expires_in_ms = inv.expires_at.saturating_duration_since(now).as_millis() as u64;
-                if inv.to == id {
-                    let from = inner.clients.get(&inv.from)?.info();
-                    Some(ServerMsg::InviteReceived { invite_id: iid.clone(), from, expires_in_ms })
-                } else if inv.from == id {
-                    Some(ServerMsg::InviteSent { invite_id: iid.clone(), to: inv.to.clone(), expires_in_ms })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for msg in invites {
-            inner.send(&id, msg);
-        }
+        restore(&inner, &id);
     }
 
     inner.broadcast_clients();
-    (id, conn_gen)
+    Some((id, conn_gen))
+}
+
+/// Re-sends sessions and pending invites to a resumed client.
+fn restore(inner: &Inner, id: &str) {
+    for sid in inner.sessions_of(id) {
+        let session = &inner.sessions[&sid];
+        let peer_id = session.peer_of(id).unwrap();
+        let initiator = session.a == id;
+        let Some(peer) = inner.clients.get(peer_id).map(Client::info) else { continue };
+        inner.send(id, ServerMsg::SessionStarted { session_id: sid.clone(), peer, initiator });
+        inner.send(id, ServerMsg::PeerStatus { session_id: sid.clone(), online: inner.is_online(peer_id) });
+        inner.send(peer_id, ServerMsg::PeerStatus { session_id: sid, online: true });
+    }
+    let now = Instant::now();
+    for (iid, inv) in &inner.invites {
+        let expires_in_ms = inv.expires_at.saturating_duration_since(now).as_millis() as u64;
+        if inv.to == id {
+            if let Some(from) = inner.clients.get(&inv.from).map(Client::info) {
+                inner.send(id, ServerMsg::InviteReceived { invite_id: iid.clone(), from, expires_in_ms });
+            }
+        } else if inv.from == id {
+            inner.send(id, ServerMsg::InviteSent { invite_id: iid.clone(), to: inv.to.clone(), expires_in_ms });
+        }
+    }
 }
 
 fn disconnect(state: &AppState, id: &str, conn_gen: u64) {
@@ -176,7 +214,7 @@ fn disconnect(state: &AppState, id: &str, conn_gen: u64) {
         if c.conn_gen != conn_gen {
             return; // already replaced by a newer connection
         }
-        c.tx = None;
+        c.conn = None;
         for sid in inner.sessions_of(id) {
             let peer = inner.sessions[&sid].peer_of(id).unwrap().to_string();
             inner.send(&peer, ServerMsg::PeerStatus { session_id: sid, online: false });
@@ -190,7 +228,7 @@ fn disconnect(state: &AppState, id: &str, conn_gen: u64) {
     tokio::spawn(async move {
         tokio::time::sleep(grace).await;
         let mut inner = state.lock();
-        let expired = inner.clients.get(&id).is_some_and(|c| c.conn_gen == conn_gen && c.tx.is_none());
+        let expired = inner.clients.get(&id).is_some_and(|c| c.conn_gen == conn_gen && c.conn.is_none());
         if expired {
             inner.remove_client(&id);
         }
@@ -199,8 +237,11 @@ fn disconnect(state: &AppState, id: &str, conn_gen: u64) {
 
 fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
     let mut inner = state.lock();
-    let error = |inner: &crate::state::Inner, message: &str| {
+    let error = |inner: &Inner, message: &str| {
         inner.send(me, ServerMsg::Error { message: message.to_string() });
+    };
+    let peer_in = |inner: &Inner, session_id: &str| {
+        inner.sessions.get(session_id).and_then(|s| s.peer_of(me)).map(str::to_string)
     };
 
     match msg {
@@ -279,33 +320,37 @@ fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
         }
 
         ClientMsg::CloseSession { session_id } => {
-            if inner.sessions.get(&session_id).is_some_and(|s| s.peer_of(me).is_some()) {
+            if peer_in(&inner, &session_id).is_some() {
                 inner.end_session(&session_id, SessionEndReason::Closed, Some(me));
             }
         }
 
         ClientMsg::Text { session_id, msg_id, text } => {
-            let Some(peer) = inner.sessions.get(&session_id).and_then(|s| s.peer_of(me)).map(str::to_string) else {
+            let Some(peer) = peer_in(&inner, &session_id) else {
                 return error(&inner, "unknown session");
             };
             let msg_id = clean(&msg_id, MAX_ID_LEN);
-            if text.len() > MAX_TEXT_LEN {
-                inner.send(me, ServerMsg::DeliveryFailed { session_id, msg_id });
-                return;
-            }
-            let sent = inner.send(&peer, ServerMsg::Text { session_id: session_id.clone(), msg_id: msg_id.clone(), text, ts: now_ms() });
-            if !sent {
+            let delivered = text.len() <= MAX_TEXT_LEN
+                && inner.relay(
+                    &peer,
+                    ServerMsg::Text { session_id: session_id.clone(), msg_id: msg_id.clone(), text, ts: now_ms() },
+                );
+            if !delivered {
                 inner.send(me, ServerMsg::DeliveryFailed { session_id, msg_id });
             }
         }
 
         ClientMsg::FileOffer { session_id, file_id, name, size, mime } => {
-            let Some(peer) = inner.sessions.get(&session_id).and_then(|s| s.peer_of(me)).map(str::to_string) else {
+            let Some(peer) = peer_in(&inner, &session_id) else {
                 return error(&inner, "unknown session");
             };
             let file_id = clean(&file_id, MAX_ID_LEN);
             if file_id.is_empty() || inner.files.contains_key(&file_id) {
                 return error(&inner, "invalid file id");
+            }
+            if inner.files.values().filter(|f| f.session_id == session_id).count() >= MAX_FILES_PER_SESSION {
+                inner.send(me, ServerMsg::DeliveryFailed { session_id, msg_id: file_id });
+                return error(&inner, "too many files in this session, start a new one");
             }
             let name = {
                 let n = clean(&name.replace(['/', '\\'], "_"), 255);
@@ -315,37 +360,37 @@ fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
                 let m = clean(&mime, 127);
                 if m.is_empty() || !m.contains('/') { "application/octet-stream".to_string() } else { m }
             };
-            inner.files.insert(
-                file_id.clone(),
-                FileOffer {
-                    session_id: session_id.clone(),
-                    owner: me.to_string(),
-                    receiver: peer.clone(),
-                    name: name.clone(),
-                    size,
-                    mime: mime.clone(),
-                },
-            );
-            let sent = inner.send(
-                &peer,
-                ServerMsg::FileOffer { session_id: session_id.clone(), file_id: file_id.clone(), name, size, mime, ts: now_ms() },
-            );
-            if !sent {
-                inner.files.remove(&file_id);
+            let offer = ServerMsg::FileOffer {
+                session_id: session_id.clone(),
+                file_id: file_id.clone(),
+                name: name.clone(),
+                size,
+                mime: mime.clone(),
+                ts: now_ms(),
+            };
+            if !inner.relay(&peer, offer) {
                 inner.send(me, ServerMsg::DeliveryFailed { session_id, msg_id: file_id });
+                return;
             }
+            inner.files.insert(
+                file_id,
+                FileOffer { session_id, owner: me.to_string(), receiver: peer, name, size, mime },
+            );
+        }
+
+        ClientMsg::RequestDownload { file_id } => {
+            if !inner.files.get(&file_id).is_some_and(|f| f.receiver == me) {
+                return error(&inner, "file is no longer available");
+            }
+            let ticket = inner.issue_ticket(me, &file_id);
+            inner.send(me, ServerMsg::DownloadTicket { file_id, ticket });
         }
 
         ClientMsg::FileUnavailable { req_id } => {
             if inner.uploads.get(&req_id).is_some_and(|u| u.owner == me) {
                 let upload = inner.uploads.remove(&req_id).unwrap();
-                let msg = ServerMsg::TransferFailed {
-                    file_id: upload.file_id.clone(),
-                    req_id,
-                    error: "the sender no longer has this file (page reloaded?)".into(),
-                };
-                inner.send(&upload.owner, msg.clone());
-                inner.send(&upload.receiver, msg);
+                let error = "the sender no longer has this file (page reloaded?)";
+                inner.transfer_failed(&upload.owner, &upload.receiver, &upload.file_id, &req_id, error);
                 let _ = upload.tx.try_send(Err(std::io::Error::other("file unavailable")));
             }
         }

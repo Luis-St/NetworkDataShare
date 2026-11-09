@@ -9,16 +9,17 @@ export type Transfer = {
   reqId: string;
   bytes: number;
   total: number;
-  state: 'waiting' | 'running' | 'done' | 'failed';
+  state: 'running' | 'done' | 'failed';
   error?: string;
 };
 
-export type TextItem = { kind: 'text'; id: string; mine: boolean; ts: number; text: string; failed?: boolean };
-export type FileItem = {
+// `key` is generated locally and only used for rendering, so ids chosen by the peer can never
+// collide in a keyed list. `id` is the protocol id (message id or file id).
+type ItemBase = { key: string; id: string; ts: number };
+export type TextItem = ItemBase & { kind: 'text'; mine: boolean; text: string; failed?: boolean };
+export type FileItem = ItemBase & {
   kind: 'file';
-  id: string;
   mine: boolean;
-  ts: number;
   name: string;
   size: number;
   mime: string;
@@ -28,7 +29,7 @@ export type FileItem = {
   delivered?: number;
   failed?: boolean;
 };
-export type SystemItem = { kind: 'system'; id: string; ts: number; text: string };
+export type SystemItem = ItemBase & { kind: 'system'; text: string };
 export type ChatItem = TextItem | FileItem | SystemItem;
 
 export type ChatSession = {
@@ -39,6 +40,8 @@ export type ChatSession = {
   closed: string | null;
   items: ChatItem[];
   unread: number;
+  /** Unsent composer text, kept while another tab is open. */
+  draft: string;
 };
 
 export type IncomingInvite = { inviteId: string; from: ClientInfo; expiresAt: number };
@@ -47,7 +50,22 @@ export type Toast = { id: string; text: string; kind: 'info' | 'error' };
 
 /** Received images up to this size are fetched automatically and shown inline. */
 const AUTO_PREVIEW_MAX = 32 * 1024 * 1024;
+/** Same limit as the server (src/ws.rs MAX_TEXT_LEN). Longer texts are sent as a .txt file. */
+const MAX_TEXT_BYTES = 1 << 20;
 const PING_INTERVAL = 20_000;
+/** Without a pong for this long the connection is treated as dead. */
+const PONG_TIMEOUT = 50_000;
+const TICKET_TIMEOUT = 5_000;
+
+/**
+ * Image types that are shown inline. SVG is excluded on purpose: it can carry script, and a preview
+ * opened in a new tab would run it in this origin.
+ */
+const PREVIEW_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif', 'image/bmp']);
+
+export function isPreviewable(mime: string): boolean {
+  return PREVIEW_TYPES.has(mime.toLowerCase());
+}
 
 type ServerMsg = { type: string; [key: string]: any };
 
@@ -72,12 +90,17 @@ class App {
   private ws: WebSocket | null = null;
   private retryDelay = 500;
   private pingTimer: number | undefined;
+  private lastPong = 0;
   /** Local files offered to peers, by file id. Only references; nothing is read until requested. */
   private files = new Map<string, File>();
   /** Which session a file belongs to, by file id. */
   private fileSession = new Map<string, string>();
   /** Sessions that must be confirmed by the server after a resumed connection. */
   private resync: Set<string> | null = null;
+  /** Invites already announced with sound, so a reconnect does not alert again. */
+  private seenInvites = new Set<string>();
+  private ticketWaiters = new Map<string, ((ticket: string | null) => void)[]>();
+  private tabs: BroadcastChannel | null = typeof BroadcastChannel === 'function' ? new BroadcastChannel('nds-tabs') : null;
 
   get others(): ClientInfo[] {
     return this.clients.filter((c) => c.id !== this.me?.id);
@@ -95,13 +118,43 @@ class App {
     return this.sessions.find((s) => s.peer.id === clientId && !s.closed);
   }
 
-  fileUrl(fileId: string): string {
-    return `/api/files/${encodeURIComponent(fileId)}?token=${encodeURIComponent(this.token ?? '')}`;
-  }
-
   // ---- connection -------------------------------------------------------------------------
 
-  connect() {
+  async start() {
+    // Answer other tabs that ask whether an identity is in use.
+    this.tabs?.addEventListener('message', (e) => {
+      if (e.data?.type === 'who' && this.me && e.data.clientId === this.me.id) {
+        this.tabs?.postMessage({ type: 'mine', clientId: this.me.id });
+      }
+    });
+    // A duplicated tab inherits sessionStorage. If another tab still uses that identity, start fresh
+    // instead of taking it over.
+    const stored = sessionStorage.getItem('nds.clientId');
+    if (stored && this.tabs && (await this.identityInUse(stored))) {
+      sessionStorage.removeItem('nds.clientId');
+      sessionStorage.removeItem('nds.token');
+      this.token = null;
+    }
+    this.connect();
+  }
+
+  private identityInUse(clientId: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      const onMessage = (e: MessageEvent) => {
+        if (e.data?.type === 'mine' && e.data.clientId === clientId) finish(true);
+      };
+      const finish = (inUse: boolean) => {
+        clearTimeout(timer);
+        this.tabs!.removeEventListener('message', onMessage);
+        resolve(inUse);
+      };
+      const timer = setTimeout(() => finish(false), 250);
+      this.tabs!.addEventListener('message', onMessage);
+      this.tabs!.postMessage({ type: 'who', clientId });
+    });
+  }
+
+  private connect() {
     this.status = 'connecting';
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${location.host}/ws`);
@@ -109,6 +162,7 @@ class App {
 
     ws.onopen = () => {
       this.retryDelay = 500;
+      this.lastPong = Date.now();
       this.send({
         type: 'hello',
         clientId: sessionStorage.getItem('nds.clientId'),
@@ -117,7 +171,10 @@ class App {
         device: this.device,
       });
       clearInterval(this.pingTimer);
-      this.pingTimer = window.setInterval(() => this.send({ type: 'ping' }), PING_INTERVAL);
+      this.pingTimer = window.setInterval(() => {
+        if (Date.now() - this.lastPong > PONG_TIMEOUT) this.dropConnection(ws);
+        else this.send({ type: 'ping' });
+      }, PING_INTERVAL);
     };
     ws.onmessage = (e) => {
       try {
@@ -126,15 +183,23 @@ class App {
         console.error('bad message', err);
       }
     };
-    ws.onclose = () => {
-      if (this.ws !== ws) return;
-      clearInterval(this.pingTimer);
-      this.status = 'offline';
-      this.ws = null;
-      for (const s of this.sessions) s.peerOnline = false;
-      setTimeout(() => this.connect(), this.retryDelay);
-      this.retryDelay = Math.min(this.retryDelay * 2, 5000);
-    };
+    ws.onclose = () => this.dropConnection(ws);
+  }
+
+  /** Handles a closed or dead connection and schedules a reconnect. */
+  private dropConnection(ws: WebSocket) {
+    if (this.ws !== ws) return;
+    ws.onclose = ws.onmessage = ws.onopen = null;
+    // On a half-open link close() would wait a long time for the close event, so do not rely on it.
+    ws.close();
+    clearInterval(this.pingTimer);
+    this.status = 'offline';
+    this.ws = null;
+    for (const s of this.sessions) s.peerOnline = false;
+    for (const [, waiters] of this.ticketWaiters) for (const w of waiters) w(null);
+    this.ticketWaiters.clear();
+    setTimeout(() => this.connect(), this.retryDelay);
+    this.retryDelay = Math.min(this.retryDelay * 2, 5000);
   }
 
   private send(msg: Record<string, unknown>): boolean {
@@ -175,22 +240,28 @@ class App {
 
   /** Ends a running session, or just removes the tab of one that has already ended. */
   closeSession(sessionId: string) {
-    const s = this.sessions.find((x) => x.id === sessionId);
+    const s = this.findSession(sessionId);
     if (!s) return;
     if (!s.closed) this.send({ type: 'close_session', sessionId });
     this.removeSession(sessionId);
   }
 
   sendText(sessionId: string, text: string) {
-    const s = this.sessions.find((x) => x.id === sessionId);
+    const s = this.findSession(sessionId);
     if (!s || s.closed || !text.trim()) return;
+    if (new Blob([text]).size > MAX_TEXT_BYTES) {
+      const file = new File([text], `${timestampName('text')}.txt`, { type: 'text/plain' });
+      this.sendFiles(sessionId, [file]);
+      this.toast('The text is too long for a message and was sent as a file.');
+      return;
+    }
     const id = uid();
     const ok = this.send({ type: 'text', sessionId, msgId: id, text });
-    s.items.push({ kind: 'text', id, mine: true, ts: Date.now(), text, failed: !ok });
+    s.items.push({ kind: 'text', key: uid(), id, mine: true, ts: Date.now(), text, failed: !ok });
   }
 
   sendFiles(sessionId: string, files: Iterable<File>) {
-    const s = this.sessions.find((x) => x.id === sessionId);
+    const s = this.findSession(sessionId);
     if (!s || s.closed) return;
     for (const file of files) {
       const id = uid();
@@ -201,13 +272,14 @@ class App {
       const ok = this.send({ type: 'file_offer', sessionId, fileId: id, name, size: file.size, mime });
       s.items.push({
         kind: 'file',
+        key: uid(),
         id,
         mine: true,
         ts: Date.now(),
         name,
         size: file.size,
         mime,
-        previewUrl: mime.startsWith('image/') ? URL.createObjectURL(file) : undefined,
+        previewUrl: isPreviewable(mime) ? URL.createObjectURL(file) : undefined,
         delivered: 0,
         failed: !ok,
       });
@@ -215,8 +287,11 @@ class App {
   }
 
   /** Received file: saves the inline preview if there is one, otherwise streams it from the sender. */
-  download(item: FileItem) {
-    triggerDownload(item.previewUrl ?? this.fileUrl(item.id), item.name);
+  async download(item: FileItem) {
+    if (item.previewUrl) return triggerDownload(item.previewUrl, item.name);
+    const ticket = await this.requestTicket(item.id);
+    if (!ticket) return this.toast('The file is no longer available.', 'error');
+    triggerDownload(this.fileUrl(item.id, ticket), item.name);
   }
 
   toast(text: string, kind: Toast['kind'] = 'info') {
@@ -227,6 +302,31 @@ class App {
 
   // ---- protocol ---------------------------------------------------------------------------
 
+  private fileUrl(fileId: string, ticket: string): string {
+    return `/api/files/${encodeURIComponent(fileId)}?ticket=${encodeURIComponent(ticket)}`;
+  }
+
+  /** Gets a single-use download ticket, so the long-lived token never shows up in a URL or history. */
+  private requestTicket(fileId: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const waiters = this.ticketWaiters.get(fileId) ?? [];
+      let done = false;
+      const finish = (ticket: string | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(ticket);
+      };
+      const timer = setTimeout(() => {
+        const list = this.ticketWaiters.get(fileId);
+        if (list) this.ticketWaiters.set(fileId, list.filter((w) => w !== finish));
+        finish(null);
+      }, TICKET_TIMEOUT);
+      this.ticketWaiters.set(fileId, [...waiters, finish]);
+      if (!this.send({ type: 'request_download', fileId })) finish(null);
+    });
+  }
+
   private findSession(id: string) {
     return this.sessions.find((s) => s.id === id);
   }
@@ -234,6 +334,10 @@ class App {
   private findFile(fileId: string): FileItem | undefined {
     const s = this.findSession(this.fileSession.get(fileId) ?? '');
     return s?.items.find((i): i is FileItem => i.kind === 'file' && i.id === fileId);
+  }
+
+  private system(s: ChatSession, text: string) {
+    s.items.push({ kind: 'system', key: uid(), id: '', ts: Date.now(), text });
   }
 
   private addItem(s: ChatSession, item: ChatItem) {
@@ -262,8 +366,8 @@ class App {
     if (s.closed) return;
     s.closed = text;
     s.peerOnline = false;
-    s.items.push({ kind: 'system', id: uid(), ts: Date.now(), text });
-    // Files can no longer be requested; keep the references only for what is already shown.
+    this.system(s, text);
+    // Files can no longer be requested; the previews stay until the tab is closed.
     for (const item of s.items) if (item.kind === 'file' && item.mine) this.files.delete(item.id);
   }
 
@@ -285,6 +389,10 @@ class App {
         }
         break;
       }
+
+      case 'pong':
+        this.lastPong = Date.now();
+        break;
 
       case 'clients': {
         this.clients = m.clients;
@@ -310,8 +418,11 @@ class App {
       case 'invite_received': {
         if (this.incoming.some((i) => i.inviteId === m.inviteId)) break;
         this.incoming.push({ inviteId: m.inviteId, from: m.from, expiresAt: Date.now() + m.expiresInMs });
-        beep();
-        notify('Share invite', `${displayName(m.from)} (${m.from.ip}) wants to share with you`, m.inviteId);
+        if (!this.seenInvites.has(m.inviteId)) {
+          this.seenInvites.add(m.inviteId);
+          beep();
+          notify('Share invite', `${displayName(m.from)} (${m.from.ip}) wants to share with you`, m.inviteId);
+        }
         break;
       }
 
@@ -339,10 +450,12 @@ class App {
           existing.peer = m.peer;
           break;
         }
-        this.sessions.push({ id: m.sessionId, peer: m.peer, peerOnline: true, closed: null, items: [], unread: 0 });
+        this.sessions.push({ id: m.sessionId, peer: m.peer, peerOnline: true, closed: null, items: [], unread: 0, draft: '' });
         const s = this.findSession(m.sessionId)!;
-        s.items.push({ kind: 'system', id: uid(), ts: Date.now(), text: `Session with ${displayName(m.peer)} started.` });
-        this.activate(m.sessionId);
+        this.system(s, `Session with ${displayName(m.peer)} started.`);
+        // The invitee just clicked Accept, so switch. The inviter may be busy in another chat.
+        if (!m.initiator || this.activeId === null) this.activate(m.sessionId);
+        else this.toast(`${displayName(m.peer)} accepted your invite.`);
         break;
       }
 
@@ -366,7 +479,7 @@ class App {
 
       case 'text': {
         const s = this.findSession(m.sessionId);
-        if (s) this.addItem(s, { kind: 'text', id: m.msgId, mine: false, ts: m.ts, text: m.text });
+        if (s) this.addItem(s, { kind: 'text', key: uid(), id: m.msgId, mine: false, ts: m.ts, text: m.text });
         break;
       }
 
@@ -374,15 +487,32 @@ class App {
         const s = this.findSession(m.sessionId);
         if (!s) break;
         this.fileSession.set(m.fileId, s.id);
-        this.addItem(s, { kind: 'file', id: m.fileId, mine: false, ts: m.ts, name: m.name, size: m.size, mime: m.mime });
-        if (m.mime.startsWith('image/') && m.size <= AUTO_PREVIEW_MAX) void this.loadPreview(m.fileId);
+        this.addItem(s, {
+          kind: 'file',
+          key: uid(),
+          id: m.fileId,
+          mine: false,
+          ts: m.ts,
+          name: m.name,
+          size: m.size,
+          mime: m.mime,
+        });
+        if (isPreviewable(m.mime) && m.size <= AUTO_PREVIEW_MAX) void this.loadPreview(m.fileId, m.mime);
         break;
       }
 
       case 'delivery_failed': {
         const s = this.findSession(m.sessionId);
-        const item = s?.items.find((i) => i.id === m.msgId);
+        const item = s?.items.find((i) => i.kind !== 'system' && i.mine && i.id === m.msgId);
         if (item && item.kind !== 'system') item.failed = true;
+        break;
+      }
+
+      case 'download_ticket': {
+        const waiters = this.ticketWaiters.get(m.fileId);
+        const next = waiters?.shift();
+        if (waiters && waiters.length === 0) this.ticketWaiters.delete(m.fileId);
+        next?.(m.ticket);
         break;
       }
 
@@ -424,9 +554,9 @@ class App {
       return;
     }
     try {
-      await fetch(`/api/upload/${encodeURIComponent(reqId)}?token=${encodeURIComponent(this.token ?? '')}`, {
+      await fetch(`/api/upload/${encodeURIComponent(reqId)}`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
+        headers: { 'Content-Type': 'application/octet-stream', 'X-NDS-Token': this.token ?? '' },
         body: file,
       });
     } catch {
@@ -434,11 +564,14 @@ class App {
     }
   }
 
-  private async loadPreview(fileId: string) {
+  private async loadPreview(fileId: string, mime: string) {
     try {
-      const res = await fetch(this.fileUrl(fileId));
+      const ticket = await this.requestTicket(fileId);
+      if (!ticket) return;
+      const res = await fetch(this.fileUrl(fileId, ticket));
       if (!res.ok) return;
-      const blob = await res.blob();
+      // Rebuild the blob with the checked type, never the one the response claims.
+      const blob = new Blob([await res.blob()], { type: mime.toLowerCase() });
       const item = this.findFile(fileId);
       if (item) item.previewUrl = URL.createObjectURL(blob);
     } catch {
@@ -447,11 +580,15 @@ class App {
   }
 }
 
-function pastedName(file: File): string {
-  const ext = (file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg').replace(/\+.*/, '');
+function timestampName(prefix: string): string {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, '0');
-  return `pasted-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+  return `${prefix}-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function pastedName(file: File): string {
+  const ext = (file.type.split('/')[1] || 'bin').replace('jpeg', 'jpg').replace(/\+.*/, '');
+  return `${timestampName('pasted')}.${ext}`;
 }
 
 export const app = new App();
