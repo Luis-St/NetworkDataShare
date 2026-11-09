@@ -1,6 +1,7 @@
 //! NetworkDataShare: share text, images and files between devices on the local network.
 
 mod assets;
+mod config;
 mod protocol;
 mod state;
 mod tls;
@@ -8,8 +9,6 @@ mod transfer;
 mod ws;
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use axum::Router;
@@ -18,7 +17,6 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, Request};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use axum::routing::{get, post};
-use clap::Parser;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
@@ -28,52 +26,9 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 
+pub use crate::config::Config;
+use crate::config::Mode;
 use crate::state::AppState;
-
-#[derive(Parser, Debug, Clone)]
-#[command(version, about = "Share text, images and files between devices on the local network")]
-pub struct Config {
-    /// Address and port to listen on.
-    #[arg(long, env = "NDS_BIND", default_value = "0.0.0.0:8080")]
-    pub bind: SocketAddr,
-
-    /// Seconds until an unanswered share invite expires.
-    #[arg(long, env = "NDS_INVITE_TIMEOUT", default_value_t = 60)]
-    pub invite_timeout: u64,
-
-    /// Seconds a disconnected client may take to reconnect before its sessions are closed.
-    #[arg(long, env = "NDS_RECONNECT_GRACE", default_value_t = 10)]
-    pub reconnect_grace: u64,
-
-    /// Serve plain HTTP instead of HTTPS (clipboard copy and notifications then only work on localhost).
-    #[arg(long, env = "NDS_HTTP")]
-    pub http: bool,
-
-    /// PEM certificate to use instead of the generated self-signed one (requires --key).
-    #[arg(long, env = "NDS_CERT")]
-    pub cert: Option<PathBuf>,
-
-    /// PEM private key matching --cert.
-    #[arg(long, env = "NDS_KEY")]
-    pub key: Option<PathBuf>,
-
-    /// Directory where the generated certificate is stored [default: the user's local data
-    /// directory, e.g. ~/.local/share/network-data-share].
-    #[arg(long, env = "NDS_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
-
-    /// Maximum number of clients (browser tabs) per IP address.
-    #[arg(long, env = "NDS_MAX_CLIENTS_PER_IP", default_value_t = 32)]
-    pub max_clients_per_ip: usize,
-}
-
-impl Config {
-    pub fn data_dir(&self) -> PathBuf {
-        self.data_dir.clone().unwrap_or_else(|| {
-            dirs::data_local_dir().map(|d| d.join("network-data-share")).unwrap_or_else(|| PathBuf::from("data"))
-        })
-    }
-}
 
 /// Time a client has to finish the TLS handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -86,7 +41,10 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let config = Config::parse();
+    let config = match config::load() {
+        Mode::Serve(c) => c,
+        Mode::Exit(code) => std::process::exit(code),
+    };
     let acceptor = if config.http {
         None
     } else {

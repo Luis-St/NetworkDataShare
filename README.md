@@ -39,6 +39,7 @@ Set `NDS_SKIP_WEB_BUILD=1` to skip npm and embed an existing `web/dist` instead,
 ```
 
 The server prints the URLs it is reachable at, by default `https://<ip>:8080`.
+`--help` lists all options, and `--info` prints a short description of the application and the configuration in effect.
 
 HTTPS is the default because browsers only allow copying to the clipboard and showing notifications on secure pages.
 On first start a self-signed certificate for `localhost`, the hostname and all local IP addresses is generated.
@@ -57,6 +58,27 @@ A plain `http://` request on the same port is redirected to `https://`.
 | `--cert`, `--key` | `NDS_CERT`, `NDS_KEY` | generated | Own PEM certificate and key instead of the self-signed one |
 | `--data-dir` | `NDS_DATA_DIR` | `~/.local/share/network-data-share` | Where the generated certificate is stored |
 | `--max-clients-per-ip` | `NDS_MAX_CLIENTS_PER_IP` | `32` | Maximum number of clients (browser tabs) per IP address |
+| `--config` | `NDS_CONFIG` | `~/.config/network-data-share/config.toml` | Config file to read, or with `--setup` to write |
+
+A value is taken from the command line first, then from the environment variable, then from the config file,
+so a single run can override the stored configuration without editing it.
+The config file uses the option names without the leading dashes as keys, for example `invite-timeout = 30`.
+An unknown key is an error, because a typo would otherwise silently fall back to the default.
+
+## Setup
+
+```bash
+./target/release/network-data-share --setup --bind 0.0.0.0:9090
+```
+
+`--setup` takes the same options as a normal run and writes them to the config file, with the defaults for every option not passed,
+so the file always describes the complete configuration instead of a mix with an older setup.
+It then generates the certificate, so the first start does not have to,
+and installs, enables and starts the systemd user service `network-data-share.service`,
+which runs the binary at its current location with that config file.
+Running `--setup` again overwrites the config file and restarts the service with the new configuration.
+Add `--no-service` to only write the config file and the certificate, for example on systems without systemd.
+A user service stops when the user logs out, `loginctl enable-linger` keeps it running.
 
 ## How it works
 

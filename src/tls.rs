@@ -6,7 +6,7 @@
 
 use std::fs;
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -27,8 +27,20 @@ const REGENERATE_AFTER: Duration = Duration::from_secs(60 * 60 * 24 * 790);
 pub fn acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 
-    let (cert_path, key_path) = match (&config.cert, &config.key) {
-        (Some(c), Some(k)) => (c.clone(), k.clone()),
+    let (cert_path, key_path) = certificate(config)?;
+    let certs = CertificateDer::pem_file_iter(&cert_path)?.collect::<Result<Vec<_>, _>>()?;
+    let key = PrivateKeyDer::from_pem_file(&key_path)?;
+    let mut tls = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
+    // HTTP/1.1 only: keeps WebSocket upgrades simple.
+    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    tracing::info!("using TLS certificate {}", cert_path.display());
+    Ok(TlsAcceptor::from(Arc::new(tls)))
+}
+
+/// Returns the certificate and key paths, generating the self-signed pair first when needed.
+pub fn certificate(config: &Config) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    match (&config.cert, &config.key) {
+        (Some(c), Some(k)) => Ok((c.clone(), k.clone())),
         (None, None) => {
             let dir = config.data_dir();
             let (cert, key, names) = (dir.join("cert.pem"), dir.join("key.pem"), dir.join("cert.names"));
@@ -43,18 +55,10 @@ pub fn acceptor(config: &Config) -> Result<TlsAcceptor, Box<dyn std::error::Erro
                 }
                 generate(&cert, &key, &names, &wanted)?;
             }
-            (cert, key)
+            Ok((cert, key))
         }
-        _ => return Err("--cert and --key must be given together".into()),
-    };
-
-    let certs = CertificateDer::pem_file_iter(&cert_path)?.collect::<Result<Vec<_>, _>>()?;
-    let key = PrivateKeyDer::from_pem_file(&key_path)?;
-    let mut tls = ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-    // HTTP/1.1 only: keeps WebSocket upgrades simple.
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    tracing::info!("using TLS certificate {}", cert_path.display());
-    Ok(TlsAcceptor::from(Arc::new(tls)))
+        _ => Err("--cert and --key must be given together".into()),
+    }
 }
 
 /// Regenerates when files are missing, the certificate is about to expire, or a current host name or
