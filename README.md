@@ -84,6 +84,10 @@ without changing anything, so a setup can be checked before it is applied.
 as a starting point to adjust instead of assembling the options by hand.
 A user service stops when the user logs out, `loginctl enable-linger` keeps it running.
 
+`install.sh` copies the binary from its own directory to `~/.local/bin` and runs `--setup` there,
+so the service keeps working after the original binary is moved or deleted.
+The configuration it sets up is written as variables at the top of the script and is meant to be edited before running it.
+
 ## How it works
 
 The browser keeps a WebSocket to `/ws` for the device list, invites, sessions and text messages.
