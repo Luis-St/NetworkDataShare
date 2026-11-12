@@ -14,6 +14,7 @@ cert.names
 # Local configuration and environment
 .env
 .env.*
+!.env.example
 config.toml
 
 # Editors and operating systems

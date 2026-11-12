@@ -1,0 +1,17 @@
+services:
+  network-data-share:
+    build: .
+    image: network-data-share:latest
+    container_name: network-data-share
+    restart: unless-stopped
+    # Host networking, so the server sees the real client IPs and the generated certificate covers the
+    # host name and LAN addresses of the machine instead of the container's internal ones.
+    network_mode: host
+    # Forwards SIGTERM to the server, so stopping the container does not wait for the kill timeout.
+    init: true
+    env_file: .env
+    volumes:
+      - data:/data
+
+volumes:
+  data:

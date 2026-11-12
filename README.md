@@ -88,11 +88,33 @@ A user service stops when the user logs out, `loginctl enable-linger` keeps it r
 so the service keeps working after the original binary is moved or deleted.
 The configuration it sets up is written as variables at the top of the script and is meant to be edited before running it.
 
+## Docker
+
+```bash
+cp .env.example .env
+docker compose up -d --build
+```
+
+`compose.yaml` builds the image from the `Dockerfile` and configures the server through the `NDS_*` variables in `.env`,
+which `.env.example` lists with their defaults.
+The container uses host networking, because the server has to see the real client IP addresses,
+and the generated certificate has to cover the host name and LAN addresses of the machine instead of the container's own.
+The certificate is stored in the `data` volume, so a rebuilt or updated container keeps it and no device sees a new browser warning.
+The image builds the frontend in a separate Node.js stage and embeds it with `NDS_SKIP_WEB_BUILD=1`,
+so the Rust stage and the final image need no Node.js.
+The server runs as an unprivileged user, and `init: true` forwards `SIGTERM` to it, so `docker compose down` stops it right away.
+
 ## How it works
 
 The browser keeps a WebSocket to `/ws` for the device list, invites, sessions and text messages.
 A session ends when either side ends it, or when one side stays disconnected for longer than the reconnect grace period,
 so a short network hiccup or a page reload does not end it.
+The server sends a WebSocket ping every 20 seconds, which the browser answers in its network stack,
+so a background tab whose timers the browser throttles to once a minute still counts as connected.
+The browser in turn treats its connection as dead only when its own ping stays unanswered for 50 seconds,
+measured from when the ping was sent and not between timer ticks, for the same reason.
+When the tab becomes visible again, it reconnects at once instead of waiting for a throttled retry timer,
+and checks with a ping that an open connection survived the time in the background.
 A reconnect takes over the old connection even if the server has not noticed yet that it is dead,
 and a duplicated browser tab detects that the copied identity is still in use and registers as a new client.
 
