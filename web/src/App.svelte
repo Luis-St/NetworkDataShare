@@ -31,13 +31,22 @@
     };
   });
 
-  // Coming back to the tab marks the open chat as read.
+  // Coming back to the tab marks the open chat as read and checks the connection.
   $effect(() => {
     const onVisible = () => {
-      if (!document.hidden && app.active) app.active.unread = 0;
+      if (document.hidden) return;
+      if (app.active) app.active.unread = 0;
+      app.wake();
     };
+    const onWake = () => app.wake();
     document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
+    window.addEventListener('pageshow', onWake);
+    window.addEventListener('online', onWake);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('pageshow', onWake);
+      window.removeEventListener('online', onWake);
+    };
   });
 </script>
 

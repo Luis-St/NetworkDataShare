@@ -53,8 +53,13 @@ const AUTO_PREVIEW_MAX = 32 * 1024 * 1024;
 /** Same limit as the server (src/ws.rs MAX_TEXT_LEN). Longer texts are sent as a .txt file. */
 const MAX_TEXT_BYTES = 1 << 20;
 const PING_INTERVAL = 20_000;
-/** Without a pong for this long the connection is treated as dead. */
+/**
+ * A ping without a pong for this long means the connection is dead. Measured from when the ping was
+ * sent, not between timer ticks, because a background tab's timers may only run once a minute.
+ */
 const PONG_TIMEOUT = 50_000;
+/** After the tab becomes visible again, a ping must be answered this quickly. */
+const WAKE_PONG_TIMEOUT = 5_000;
 const TICKET_TIMEOUT = 5_000;
 
 /**
@@ -90,7 +95,9 @@ class App {
   private ws: WebSocket | null = null;
   private retryDelay = 500;
   private pingTimer: number | undefined;
-  private lastPong = 0;
+  private retryTimer: number | undefined;
+  /** When the unanswered ping was sent, `null` while no ping is outstanding. */
+  private pingSentAt: number | null = null;
   /** Local files offered to peers, by file id. Only references; nothing is read until requested. */
   private files = new Map<string, File>();
   /** Which session a file belongs to, by file id. */
@@ -162,7 +169,7 @@ class App {
 
     ws.onopen = () => {
       this.retryDelay = 500;
-      this.lastPong = Date.now();
+      this.pingSentAt = null;
       this.send({
         type: 'hello',
         clientId: sessionStorage.getItem('nds.clientId'),
@@ -172,8 +179,8 @@ class App {
       });
       clearInterval(this.pingTimer);
       this.pingTimer = window.setInterval(() => {
-        if (Date.now() - this.lastPong > PONG_TIMEOUT) this.dropConnection(ws);
-        else this.send({ type: 'ping' });
+        if (this.pingSentAt === null) this.ping();
+        else if (Date.now() - this.pingSentAt > PONG_TIMEOUT) this.dropConnection(ws);
       }, PING_INTERVAL);
     };
     ws.onmessage = (e) => {
@@ -198,8 +205,33 @@ class App {
     for (const s of this.sessions) s.peerOnline = false;
     for (const [, waiters] of this.ticketWaiters) for (const w of waiters) w(null);
     this.ticketWaiters.clear();
-    setTimeout(() => this.connect(), this.retryDelay);
+    this.retryTimer = window.setTimeout(() => this.connect(), this.retryDelay);
     this.retryDelay = Math.min(this.retryDelay * 2, 5000);
+  }
+
+  private ping() {
+    if (this.send({ type: 'ping' })) this.pingSentAt = Date.now();
+  }
+
+  /**
+   * Called when the tab becomes visible or the device comes back online. A background tab's reconnect
+   * timer may be throttled for a minute, so reconnect right away, and check that an open connection
+   * survived the time in the background instead of waiting for the next ping.
+   */
+  wake() {
+    if (this.ws === null) {
+      clearTimeout(this.retryTimer);
+      this.retryDelay = 500;
+      this.connect();
+      return;
+    }
+    const ws = this.ws;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (this.pingSentAt === null) this.ping();
+    const sentAt = this.pingSentAt;
+    setTimeout(() => {
+      if (this.ws === ws && sentAt !== null && this.pingSentAt === sentAt) this.dropConnection(ws);
+    }, WAKE_PONG_TIMEOUT);
   }
 
   private send(msg: Record<string, unknown>): boolean {
@@ -391,7 +423,7 @@ class App {
       }
 
       case 'pong':
-        this.lastPong = Date.now();
+        this.pingSentAt = null;
         break;
 
       case 'clients': {

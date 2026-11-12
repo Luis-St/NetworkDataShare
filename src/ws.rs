@@ -23,7 +23,10 @@ pub const MAX_TEXT_LEN: usize = 1 << 20;
 /// JSON escaping can grow text up to 6x (`\u0001`), plus room for the other fields.
 const MAX_FRAME_LEN: usize = 6 * MAX_TEXT_LEN + (64 << 10);
 const MAX_FILES_PER_SESSION: usize = 10_000;
-/// Browsers send an application-level ping every 20 s; a silent connection is considered dead.
+/// Interval of the WebSocket ping frames the server sends. Browsers answer them in the network stack,
+/// even while a background tab's timers are throttled, so a healthy connection is never silent.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+/// A connection that sent nothing (not even a pong) for this long is considered dead.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn handler(
@@ -83,12 +86,23 @@ async fn handle_socket(socket: WebSocket, state: AppState, addr: SocketAddr) {
     };
 
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            let len = msg.len();
-            if sink.send(Message::Text(msg)).await.is_err() {
-                break;
+        let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    let len = msg.len();
+                    if sink.send(Message::Text(msg)).await.is_err() {
+                        break;
+                    }
+                    queued.fetch_sub(len, Ordering::Relaxed);
+                }
+                _ = ping.tick() => {
+                    if sink.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
             }
-            queued.fetch_sub(len, Ordering::Relaxed);
         }
         let _ = sink.close().await;
     });
