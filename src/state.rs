@@ -2,7 +2,7 @@
 //!
 //! Nothing is persisted; everything disappears with the session or the process.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -17,7 +17,7 @@ use crate::protocol::{ClientInfo, InviteOutcome, ServerMsg, SessionEndReason};
 
 pub type ChunkTx = mpsc::Sender<Result<Bytes, io::Error>>;
 
-/// Queued but unsent bytes above which relayed user content is refused for a client.
+/// Unacknowledged relayed bytes above which further user content is refused for a client.
 const RELAY_QUEUE_LIMIT: usize = 4 << 20;
 /// Queued but unsent bytes above which a client is considered stuck and disconnected.
 const HARD_QUEUE_LIMIT: usize = 16 << 20;
@@ -61,6 +61,13 @@ pub struct Client {
     pub conn: Option<Conn>,
     /// Incremented on every (re)connect so stale connections and timers can be ignored.
     pub conn_gen: u64,
+    /// Relayed user content the browser has not acknowledged yet, oldest first. It is kept until the
+    /// `ack` arrives and re-sent on a resumed connection, so nothing is lost while the client is
+    /// disconnected or its connection died without being noticed (frozen background tab).
+    pub inbox: VecDeque<(u64, Utf8Bytes)>,
+    pub inbox_bytes: usize,
+    /// Sequence number of the last message put into the inbox.
+    pub last_seq: u64,
 }
 
 impl Client {
@@ -182,9 +189,41 @@ impl Inner {
         self.conn(client_id).is_some_and(|c| c.push(encode(&msg), HARD_QUEUE_LIMIT))
     }
 
-    /// Sends user content from a peer. Refused (returns false) while the receiver is not keeping up.
-    pub fn relay(&self, client_id: &str, msg: ServerMsg) -> bool {
-        self.conn(client_id).is_some_and(|c| c.push(encode(&msg), RELAY_QUEUE_LIMIT))
+    /// Sends user content from a peer, built with its sequence number. It is kept in the receiver's
+    /// inbox until acknowledged, so it also reaches a client that is currently disconnected once it
+    /// reconnects. Refused (returns false) while too much is unacknowledged.
+    pub fn relay(&mut self, client_id: &str, build: impl FnOnce(u64) -> ServerMsg) -> bool {
+        let Some(c) = self.clients.get_mut(client_id) else { return false };
+        let msg = encode(&build(c.last_seq + 1));
+        // One message is always accepted, even if it is larger than the limit on its own.
+        if c.inbox_bytes > 0 && c.inbox_bytes + msg.len() > RELAY_QUEUE_LIMIT {
+            return false;
+        }
+        c.last_seq += 1;
+        c.inbox_bytes += msg.len();
+        c.inbox.push_back((c.last_seq, msg.clone()));
+        if let Some(conn) = &c.conn {
+            conn.push(msg, HARD_QUEUE_LIMIT);
+        }
+        true
+    }
+
+    /// Drops everything up to `seq` from a client's inbox.
+    pub fn ack(&mut self, client_id: &str, seq: u64) {
+        let Some(c) = self.clients.get_mut(client_id) else { return };
+        while c.inbox.front().is_some_and(|(s, _)| *s <= seq) {
+            let (_, msg) = c.inbox.pop_front().unwrap();
+            c.inbox_bytes -= msg.len();
+        }
+    }
+
+    /// Re-sends the unacknowledged inbox over a client's current connection.
+    pub fn resend_inbox(&self, client_id: &str) {
+        let Some(c) = self.clients.get(client_id) else { return };
+        let Some(conn) = &c.conn else { return };
+        for (_, msg) in &c.inbox {
+            conn.push(msg.clone(), HARD_QUEUE_LIMIT);
+        }
     }
 
     pub fn is_online(&self, client_id: &str) -> bool {

@@ -17,6 +17,8 @@ Open the page on two devices, send an invite from one, accept it on the other, a
 Nothing is stored.
 Messages only live in the two open browser tabs, and files are piped from the sender to the receiver through the server without touching its disk,
 so a session leaves no trace on the server once it ends.
+The server only holds a message in memory until the receiving tab confirms it,
+so a message sent while the other tab is disconnected, for example because the browser suspended it in the background, arrives once it reconnects.
 Reloading a tab keeps its sessions, but clears that tab's chat history and its offered files, because they only exist in the page.
 
 ## Build

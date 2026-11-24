@@ -73,6 +73,10 @@ pub enum ClientMsg {
     RequestDownload {
         file_id: String,
     },
+    /// Acknowledges all relayed messages up to and including this sequence number.
+    Ack {
+        seq: u64,
+    },
     Ping,
 }
 
@@ -126,13 +130,16 @@ pub enum ServerMsg {
         session_id: String,
         online: bool,
     },
+    /// Relayed messages carry a per-receiver sequence number, see `ClientMsg::Ack`.
     Text {
+        seq: u64,
         session_id: String,
         msg_id: String,
         text: String,
         ts: u64,
     },
     FileOffer {
+        seq: u64,
         session_id: String,
         file_id: String,
         name: String,

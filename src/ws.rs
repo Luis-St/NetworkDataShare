@@ -172,7 +172,18 @@ fn register(
         inner.tokens.insert(token.clone(), id.clone());
         inner.clients.insert(
             id.clone(),
-            Client { id: id.clone(), token, name, device, ip: ip.clone(), conn: Some(conn), conn_gen: 0 },
+            Client {
+                id: id.clone(),
+                token,
+                name,
+                device,
+                ip: ip.clone(),
+                conn: Some(conn),
+                conn_gen: 0,
+                inbox: Default::default(),
+                inbox_bytes: 0,
+                last_seq: 0,
+            },
         );
         (id, 0)
     };
@@ -191,6 +202,7 @@ fn register(
 
     if resumable {
         restore(&inner, &id);
+        inner.resend_inbox(&id);
     }
 
     inner.broadcast_clients();
@@ -263,6 +275,7 @@ fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
         ClientMsg::Ping => {
             inner.send(me, ServerMsg::Pong);
         }
+        ClientMsg::Ack { seq } => inner.ack(me, seq),
 
         ClientMsg::SetName { name } => {
             if let Some(c) = inner.clients.get_mut(me) {
@@ -345,10 +358,13 @@ fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
             };
             let msg_id = clean(&msg_id, MAX_ID_LEN);
             let delivered = text.len() <= MAX_TEXT_LEN
-                && inner.relay(
-                    &peer,
-                    ServerMsg::Text { session_id: session_id.clone(), msg_id: msg_id.clone(), text, ts: now_ms() },
-                );
+                && inner.relay(&peer, |seq| ServerMsg::Text {
+                    seq,
+                    session_id: session_id.clone(),
+                    msg_id: msg_id.clone(),
+                    text,
+                    ts: now_ms(),
+                });
             if !delivered {
                 inner.send(me, ServerMsg::DeliveryFailed { session_id, msg_id });
             }
@@ -374,7 +390,8 @@ fn dispatch(state: &AppState, me: &str, msg: ClientMsg) {
                 let m = clean(&mime, 127);
                 if m.is_empty() || !m.contains('/') { "application/octet-stream".to_string() } else { m }
             };
-            let offer = ServerMsg::FileOffer {
+            let offer = |seq| ServerMsg::FileOffer {
+                seq,
                 session_id: session_id.clone(),
                 file_id: file_id.clone(),
                 name: name.clone(),

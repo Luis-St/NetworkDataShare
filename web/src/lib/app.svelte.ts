@@ -106,6 +106,11 @@ class App {
   private resync: Set<string> | null = null;
   /** Invites already announced with sound, so a reconnect does not alert again. */
   private seenInvites = new Set<string>();
+  /**
+   * Sequence number of the last relayed message (text or file offer) handled. The server keeps every
+   * message until it is acknowledged and re-sends the rest after a reconnect, so older ones are skipped.
+   */
+  private lastSeq = 0;
   private ticketWaiters = new Map<string, ((ticket: string | null) => void)[]>();
   private tabs: BroadcastChannel | null = typeof BroadcastChannel === 'function' ? new BroadcastChannel('nds-tabs') : null;
 
@@ -403,7 +408,16 @@ class App {
     for (const item of s.items) if (item.kind === 'file' && item.mine) this.files.delete(item.id);
   }
 
+  /** Acknowledges a relayed message and tells whether it is new, or a re-sent one already handled. */
+  private accept(seq: number): boolean {
+    this.send({ type: 'ack', seq });
+    if (seq <= this.lastSeq) return false;
+    this.lastSeq = seq;
+    return true;
+  }
+
   private handle(m: ServerMsg) {
+    if ((m.type === 'text' || m.type === 'file_offer') && !this.accept(m.seq)) return;
     switch (m.type) {
       case 'welcome': {
         this.me = { id: m.clientId, ip: m.ip };
@@ -414,6 +428,7 @@ class App {
         this.status = 'online';
         this.incoming = [];
         this.outgoing = {};
+        if (!m.resumed) this.lastSeq = 0;
         if (m.resumed) {
           this.resync = new Set(this.sessions.filter((s) => !s.closed).map((s) => s.id));
         } else {
